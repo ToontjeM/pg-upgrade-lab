@@ -10,6 +10,8 @@ side, same setup on both, nothing mocked: every result comes from a real command
 
 Open `http://localhost:3000` after provisioning for the graphical, click-through version of every use case below.
 
+![Overview tab](screenshots/overview.png)
+
 ## The three pillars
 
 1. **Security -- PostgreSQL 14 vs 18, plus a second scenario on 15.5 vs 15.6.** Before PostgreSQL 15, any role that
@@ -94,13 +96,19 @@ Open `http://localhost:3000`. Four tabs:
   block below it runs the same three-button pattern for CVE-2024-0985 (`PostgreSQL 15.5` vs `15.6`) -- here the
   *second* step ("Admin: refresh materialized view") is where the old version escalates and the new one blocks it,
   the opposite step from the scenario above it.
+
+  ![Security tab](screenshots/security.png)
 - **Performance** -- pick a repetition count and run the skip-scan query against both nodes live. Real per-run
   timings and buffer-page counts (via `EXPLAIN (ANALYZE, BUFFERS)`), not averages pre-baked into the page.
+
+  ![Performance tab](screenshots/performance.png)
 - **Reliability** -- "Write row" inserts through whichever node is currently primary; "Simulate failover" stops
   that primary and promotes the standby, then repoints the subscriber -- watch the subscription worker survive on
   PG18 and die on PG16. "Reset" tears down and rebuilds that version's 3 containers and volumes from scratch via
   `docker compose` (the app has full control of the Docker host for this, same tradeoff as the socket-mounted
   High Availability tab in this project's sibling `pgpooldemo`) -- it takes a little while, mirroring a real resync.
+
+  ![Reliability tab](screenshots/reliability.png)
 - **SQL Console** (top right) -- run arbitrary SQL against any of the 12 Postgres nodes directly.
 
 ## Notes

@@ -45,24 +45,29 @@
       <div class="node-grid">
         <div class="card">
           <h3>Security &mdash; PG14 vs PG18</h3>
-          <p>Before PostgreSQL 15, any role that can merely <code>CONNECT</code> to a database can also create objects
-          in its <code>public</code> schema by default &mdash; nobody has to grant that, it's just on. Chained with an
-          ordinary, idempotent deploy script, that's enough for a low-privileged app credential to make itself
-          superuser. PG15 revoked that default; PG18 inherits the fix. This tab also runs a second scenario on
-          <b>PG15.5 vs PG15.6</b> &mdash; same story, but a <i>minor</i>-version patch (CVE-2024-0985), not a major
-          upgrade.</p>
+          <p>Before PostgreSQL 15, any role that can merely <code>CONNECT</code> to a database can also create
+          objects in its <code>public</code> schema by default &mdash; nobody has to grant that, it's just on.</p>
+          <p>Chained with an ordinary, idempotent deploy script, that's enough for a low-privileged app credential to
+          make itself superuser.</p>
+          <div class="highlight"><b>PG15 revoked that default</b>; PG18 inherits the fix.</div>
+          <p class="footnote">This tab also runs a second scenario on <b>PG15.5 vs PG15.6</b> &mdash; same story, but
+          a <i>minor</i>-version patch (CVE-2024-0985), not a major upgrade.</p>
         </div>
         <div class="card">
           <h3>Performance &mdash; PG17 vs PG18</h3>
           <p>PostgreSQL 18's B-tree indexes can skip over irrelevant values in a composite index's leading column,
-          even when the query has no predicate on that column at all. PG17 has to scan the whole index instead. This
-          tab runs the same query against both, live, and shows the real buffer-page counts Postgres itself reports.</p>
+          even when the query has no predicate on that column at all.</p>
+          <p>PG17 has no such capability, so it has to scan the whole index instead.</p>
+          <div class="highlight">Confirmed live: <b>PG17 touches ~112,000 buffer pages</b> for this query;
+          <b>PG18 touches ~180</b>. This tab runs it against both and shows the real counts Postgres reports.</div>
         </div>
         <div class="card">
           <h3>Reliability &mdash; PG16 vs PG18</h3>
-          <p>PostgreSQL 17 added logical replication slots that survive failover (<code>sync_replication_slots</code>).
-          Promote a standby on PG16 and every logical subscriber breaks &mdash; the slot never existed on that node,
-          and fixing it means a manual, full resync. On PG18 the slot just follows the standby, no resync required.</p>
+          <p>PostgreSQL 17 added logical replication slots that survive failover
+          (<code>sync_replication_slots</code>).</p>
+          <p>Promote a standby on PG16 and every logical subscriber breaks &mdash; the slot never existed on that
+          node, and fixing it means a manual, full resync.</p>
+          <div class="highlight">On <b>PG18</b> the slot just follows the standby &mdash; no resync required.</div>
         </div>
       </div>
       <div class="view-header contrast" style="margin-top:26px;">
