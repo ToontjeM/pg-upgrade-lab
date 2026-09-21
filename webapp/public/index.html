@@ -27,7 +27,7 @@
   <nav class="tab-rail">
     <button class="tab-btn active" data-view="overview"><span class="t-title">Overview</span><span class="t-desc">Why upgrade at all</span></button>
     <button class="tab-btn" data-view="security"><span class="t-title">Security</span><span class="t-desc">Public-schema escalation</span></button>
-    <button class="tab-btn" data-view="performance"><span class="t-title">Performance</span><span class="t-desc">Asynchronous I/O</span></button>
+    <button class="tab-btn" data-view="performance"><span class="t-title">Performance</span><span class="t-desc">B-tree skip scan</span></button>
     <button class="tab-btn" data-view="reliability"><span class="t-title">Reliability</span><span class="t-desc">Failover-safe replication</span></button>
   </nav>
 
@@ -48,13 +48,15 @@
           <p>Before PostgreSQL 15, any role that can merely <code>CONNECT</code> to a database can also create objects
           in its <code>public</code> schema by default &mdash; nobody has to grant that, it's just on. Chained with an
           ordinary, idempotent deploy script, that's enough for a low-privileged app credential to make itself
-          superuser. PG15 revoked that default; PG18 inherits the fix.</p>
+          superuser. PG15 revoked that default; PG18 inherits the fix. This tab also runs a second scenario on
+          <b>PG15.5 vs PG15.6</b> &mdash; same story, but a <i>minor</i>-version patch (CVE-2024-0985), not a major
+          upgrade.</p>
         </div>
         <div class="card">
           <h3>Performance &mdash; PG17 vs PG18</h3>
-          <p>PostgreSQL 18 introduced asynchronous I/O (<code>io_method</code>): reads no longer have to block one at a
-          time on storage. PG17 has no such setting at all. The benefit shows up specifically as storage latency goes
-          up &mdash; this tab runs the same scans against both, live, and shows the real numbers, good or bad.</p>
+          <p>PostgreSQL 18's B-tree indexes can skip over irrelevant values in a composite index's leading column,
+          even when the query has no predicate on that column at all. PG17 has to scan the whole index instead. This
+          tab runs the same query against both, live, and shows the real buffer-page counts Postgres itself reports.</p>
         </div>
         <div class="card">
           <h3>Reliability &mdash; PG16 vs PG18</h3>
@@ -66,6 +68,14 @@
       <div class="view-header contrast" style="margin-top:26px;">
         <b>The pattern across all three:</b> none of this requires exotic configuration or bad luck. It's what
         happens when perfectly ordinary operational practice meets a version that's a few years behind.
+      </div>
+      <div class="view-header section-gap">
+        <div class="contrast">
+          <b>These scenarios are just examples.</b> There are many more enhancements between major and minor
+          versions of PostgreSQL than this lab can show hands-on. See the official release notes at
+          <a href="https://www.postgresql.org/docs/release/" target="_blank" rel="noopener">postgresql.org/docs/release</a>
+          for the full list for any version.
+        </div>
       </div>
     </section>
 
@@ -117,52 +127,86 @@
       </div>
       <p class="small-note section-gap">Same script runs against both -- see <code>security/init.sql</code> and
       <code>webapp/server.js</code>. Nothing here is version-specific except each server's own default privileges.</p>
+
+      <div class="view-header section-gap">
+        <h2>CVE-2024-0985: a minor-version fix, not a major one</h2>
+        <p><code>REFRESH MATERIALIZED VIEW CONCURRENTLY</code> is meant to run a view's own SQL as the view's
+        <i>owner</i>, precisely so a privileged user can safely refresh a materialized view someone else created.
+        Role <code>r0</code> &mdash; an ordinary application role with its own database, nothing unusual granted
+        &mdash; plants a materialized view that hijacks a brief moment where Postgres drops that protection while
+        building its own internal temp table. An admin routinely refreshing that view is all it takes.</p>
+        <div class="contrast"><b>This isn't PG17 vs PG18</b> &mdash; both sides below are PostgreSQL 15. <b>15.6</b>
+        (released the same day as this fix, 2024-02-08) rejects the refresh outright; <b>15.5</b> silently makes
+        <code>r0</code> superuser. Staying current on <i>minor</i> releases matters as much as major ones -- see the
+        note on the Overview tab.</div>
+      </div>
+
+      <div class="grid-1" id="cve-grid">
+        <div class="card target-old" data-target="old">
+          <h3>PostgreSQL 15.5 <span class="badge old">vulnerable</span></h3>
+          <table class="kv-table">
+            <tr><td>Materialized view planted</td><td class="v-has-mv">&mdash;</td></tr>
+            <tr><td>r0 is superuser</td><td class="v-rolsuper">&mdash;</td></tr>
+          </table>
+          <div class="controls-row">
+            <button class="btn primary" data-action="attack" data-target="old">1. Attacker: plant exploit</button>
+            <button class="btn" data-action="refresh" data-target="old">2. Admin: refresh materialized view</button>
+            <button class="btn ghost" data-action="reset" data-target="old">Reset</button>
+          </div>
+          <div class="status-line" id="cve-old-status"></div>
+          <pre class="sql-preview" id="cve-old-sql" hidden></pre>
+        </div>
+
+        <div class="card target-new" data-target="new">
+          <h3>PostgreSQL 15.6 <span class="badge new">fixed</span></h3>
+          <table class="kv-table">
+            <tr><td>Materialized view planted</td><td class="v-has-mv">&mdash;</td></tr>
+            <tr><td>r0 is superuser</td><td class="v-rolsuper">&mdash;</td></tr>
+          </table>
+          <div class="controls-row">
+            <button class="btn primary" data-action="attack" data-target="new">1. Attacker: plant exploit</button>
+            <button class="btn" data-action="refresh" data-target="new">2. Admin: refresh materialized view</button>
+            <button class="btn ghost" data-action="reset" data-target="new">Reset</button>
+          </div>
+          <div class="status-line" id="cve-new-status"></div>
+          <pre class="sql-preview" id="cve-new-sql" hidden></pre>
+        </div>
+      </div>
+      <p class="small-note section-gap">Same script runs against both -- see <code>security/init-cve.sql</code> and
+      <code>webapp/server.js</code>. The only difference is whether the CVE-2024-0985 fix is present in that minor
+      release.</p>
     </section>
 
     <!-- ============================== PERFORMANCE ============================== -->
     <section class="view" id="view-performance">
       <div class="view-header">
-        <h2>Asynchronous I/O</h2>
-        <p>PostgreSQL 18 can issue multiple reads at once instead of blocking one at a time (<code>io_method =
-        worker</code> or <code>io_uring</code>); PG17 has no such setting. Both nodes here share the same
-        <code>shared_buffers</code> and the same 768MB container memory cap against a ~3.75GB table, so scans are
-        genuinely I/O-bound rather than served from cache.</p>
-        <div class="contrast"><b>Be aware:</b> AIO's benefit is hiding storage <i>latency</i>. On fast local disk (which
-        is what this laptop/Docker Desktop gives both containers) that latency barely exists, so a live run here may
-        show a small gain, no difference, or occasionally PG18 slightly behind -- that's an honest result, not a
-        broken demo. The gap is real and larger on the network-attached storage typical of production and cloud
-        databases -- turn up <b>Disk throughput</b> below to simulate that and open the gap back up.</div>
+        <h2>B-tree skip scan</h2>
+        <p>PostgreSQL 18 can jump over irrelevant values in a composite index's leading column instead of scanning
+        every entry, even though the query below has no predicate on that leading column (<code>tenant_id</code>) at
+        all -- only on the trailing one (<code>serial_no</code>), which has no index of its own. PG17 has no such
+        capability, so it must scan the whole composite index instead.</p>
+        <div class="contrast">This is an algorithmic win, not an I/O one, so -- unlike this tab's earlier async-I/O
+        scenarios -- it doesn't need slow storage to show up: it's measured in <b>buffer pages touched</b> (Postgres's
+        own count from <code>EXPLAIN (ANALYZE, BUFFERS)</code>), not milliseconds, and the gap is the same on fast
+        local disk as anywhere else.</div>
       </div>
 
       <div class="grid-2" id="perf-grid">
         <div class="card target-old" data-target="old">
-          <h3>PostgreSQL 17 <span class="badge old">sync I/O only</span></h3>
+          <h3>PostgreSQL 17 <span class="badge old">no skip scan</span></h3>
           <table class="kv-table">
-            <tr><td>io_method</td><td class="v-io-method">&mdash;</td></tr>
-            <tr><td>shared_buffers</td><td class="v-shared-buffers">&mdash;</td></tr>
             <tr><td>bench table seeded</td><td class="v-seeded">&mdash;</td></tr>
           </table>
         </div>
         <div class="card target-new" data-target="new">
-          <h3>PostgreSQL 18 <span class="badge new">io_method = worker</span></h3>
+          <h3>PostgreSQL 18 <span class="badge new">B-tree skip scan</span></h3>
           <table class="kv-table">
-            <tr><td>io_method</td><td class="v-io-method">&mdash;</td></tr>
-            <tr><td>shared_buffers</td><td class="v-shared-buffers">&mdash;</td></tr>
             <tr><td>bench table seeded</td><td class="v-seeded">&mdash;</td></tr>
           </table>
         </div>
       </div>
 
       <div class="controls-row section-gap">
-        <label class="field" title="Real cgroup I/O throttling on both containers' storage (see server.js) -- not a simulated delay -- to stand in for slower network-attached storage. Same idea as the network-latency control in this project's sibling pgd-cluster demo, just for disk.">Disk throughput
-          <select id="perf-disk-limit"></select>
-        </label>
-        <label class="field">Scenario
-          <select id="perf-scenario">
-            <option value="bitmap">Bitmap heap scan (0.2% selectivity)</option>
-            <option value="seqscan">Sequential scan (no match)</option>
-          </select>
-        </label>
         <label class="field">Repetitions
           <input type="number" id="perf-reps" value="3" min="1" max="6" />
         </label>
@@ -176,12 +220,14 @@
           <div class="combo-sub">real per-run timings, most recent run</div>
           <div class="dist-row"><span>runs (ms)</span><span class="v-runs" style="font-family:var(--font-mono)"></span><span></span></div>
           <div class="dist-row"><span>average</span><span></span><span class="v-avg dist-count"></span></div>
+          <div class="dist-row" title="Buffer pages Postgres itself reports touching (EXPLAIN BUFFERS) -- unlike timing, this doesn't depend on storage speed."><span>buffers touched</span><span></span><span class="v-buffers dist-count"></span></div>
         </div>
         <div class="combo-card" id="perf-new-card">
           <h4>PostgreSQL 18</h4>
           <div class="combo-sub">real per-run timings, most recent run</div>
           <div class="dist-row"><span>runs (ms)</span><span class="v-runs" style="font-family:var(--font-mono)"></span><span></span></div>
           <div class="dist-row"><span>average</span><span></span><span class="v-avg dist-count"></span></div>
+          <div class="dist-row" title="Buffer pages Postgres itself reports touching (EXPLAIN BUFFERS) -- unlike timing, this doesn't depend on storage speed."><span>buffers touched</span><span></span><span class="v-buffers dist-count"></span></div>
         </div>
       </div>
     </section>

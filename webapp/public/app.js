@@ -115,94 +115,100 @@ document.querySelectorAll('#security-grid [data-action]').forEach((btn) => {
   });
 });
 
-// ---- Performance tab --------------------------------------------------------------
-let perfScenarios = null;
-async function loadPerfScenarios() {
-  if (perfScenarios) return perfScenarios;
-  perfScenarios = await api('GET', '/api/performance/scenarios');
-  return perfScenarios;
-}
-async function updatePerfSqlPreview() {
-  const scenarios = await loadPerfScenarios();
-  const scenario = scenarios[document.getElementById('perf-scenario').value];
-  showSql(document.getElementById('perf-sql'), 'Query run on both nodes', scenario.sql);
-}
-document.getElementById('perf-scenario').addEventListener('change', () => updatePerfSqlPreview().catch(() => {}));
-updatePerfSqlPreview().catch(() => {});
-
-function diskLimitLabel(mbps) {
-  return mbps === 0 ? 'Off (Docker Desktop default, very fast)' : `${mbps} MB/s per node (network-attached storage)`;
-}
-
-async function loadDiskLimitState() {
-  const { mbps, options } = await api('GET', '/api/performance/disk-limit');
-  const select = document.getElementById('perf-disk-limit');
-  select.innerHTML = options.map((v) => `<option value="${v}">${diskLimitLabel(v)}</option>`).join('');
-  select.value = String(mbps);
-}
-
-document.getElementById('perf-disk-limit').addEventListener('change', async () => {
-  const select = document.getElementById('perf-disk-limit');
-  const statusEl = document.getElementById('perf-status');
-  const mbps = Number(select.value);
-  select.disabled = true;
-  try {
-    const result = await api('POST', '/api/performance/disk-limit', { mbps });
-    if (result.failed.length) setStatus(statusEl, `Disk throughput applied to most nodes, but failed on: ${result.failed.join('; ')}`, 'err');
-  } catch (err) {
-    setStatus(statusEl, err.message, 'err');
-  } finally {
-    select.disabled = false;
+// ---- Security tab, second scenario (CVE-2024-0985) --------------------------------
+async function refreshCve() {
+  const data = await api('GET', '/api/cve/status');
+  for (const key of ['old', 'new']) {
+    const card = document.querySelector(`#cve-grid .card[data-target="${key}"]`);
+    const s = data[key];
+    card.querySelector('.v-has-mv').textContent = s.hasMv ? 'yes' : 'no';
+    const rs = card.querySelector('.v-rolsuper');
+    rs.textContent = s.rolsuper ? 'YES -- escalated' : 'no';
+    rs.style.color = s.rolsuper ? 'var(--color-danger)' : '';
   }
+}
+
+document.querySelectorAll('#cve-grid [data-action]').forEach((btn) => {
+  btn.addEventListener('click', async () => {
+    const target = btn.dataset.target;
+    const statusEl = document.getElementById(`cve-${target}-status`);
+    btn.disabled = true;
+    try {
+      const sqlEl = document.getElementById(`cve-${target}-sql`);
+      if (btn.dataset.action === 'attack') {
+        const r = await api('POST', '/api/cve/attack', { target });
+        showSql(sqlEl, 'Ran as r0', r.sql);
+        setStatus(statusEl, r.blocked ? `Blocked: ${r.error}` : 'Materialized view planted.', r.blocked ? 'err' : 'ok');
+      } else if (btn.dataset.action === 'refresh') {
+        const r = await api('POST', '/api/cve/refresh', { target });
+        showSql(sqlEl, 'Ran as postgres (the admin)', r.sql);
+        if (r.blocked) setStatus(statusEl, `Blocked: ${r.error}`, 'ok');
+        else if (r.rolsuper) setStatus(statusEl, 'Refresh ran -- r0 is now SUPERUSER.', 'err');
+        else setStatus(statusEl, 'Refresh ran. No effect.', 'ok');
+      } else if (btn.dataset.action === 'reset') {
+        const r = await api('POST', '/api/cve/reset', { target });
+        showSql(sqlEl, 'Ran as postgres', r.sql);
+        setStatus(statusEl, 'Reset.', 'ok');
+      }
+      await refreshCve();
+    } catch (err) {
+      setStatus(statusEl, err.message, 'err');
+    } finally {
+      btn.disabled = false;
+    }
+  });
 });
 
+// ---- Performance tab --------------------------------------------------------------
 async function refreshPerformance() {
   const data = await api('GET', '/api/performance/status');
   for (const key of ['old', 'new']) {
     const card = document.querySelector(`#perf-grid .card[data-target="${key}"]`);
     const s = data[key];
-    card.querySelector('.v-io-method').textContent = s.ioMethod;
-    card.querySelector('.v-shared-buffers').textContent = s.sharedBuffers;
-    card.querySelector('.v-seeded').textContent = s.seeded ? 'yes (~3.75GB, 12M rows)' : 'seeding on first boot...';
+    card.querySelector('.v-seeded').textContent = s.seeded
+      ? s.skipScanReady ? 'yes' : 'seeded, backfilling skip-scan columns...'
+      : 'seeding on first boot...';
   }
-  document.getElementById('btn-run-perf').disabled = !(data.old.seeded && data.new.seeded);
+  document.getElementById('btn-run-perf').disabled = !(
+    data.old.seeded && data.new.seeded && data.old.skipScanReady && data.new.skipScanReady
+  );
 }
 
 document.getElementById('btn-run-perf').addEventListener('click', async () => {
   const statusEl = document.getElementById('perf-status');
   const btn = document.getElementById('btn-run-perf');
-  const scenario = document.getElementById('perf-scenario').value;
   const reps = document.getElementById('perf-reps').value;
-  const diskLimitMbps = Number(document.getElementById('perf-disk-limit').value);
   const btnLabel = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Running...';
-  setBusyStatus(
-    statusEl,
-    diskLimitMbps > 0
-      ? `Running against both nodes with disk throttled to ${diskLimitMbps} MB/s -- a full scan moves ~3.75GB, so this can take a while (lower the repetitions or pick the bitmap scenario if it's too slow)...`
-      : 'Running against both nodes, cold and warm reps mixed -- this can take a few seconds...'
-  );
+  setBusyStatus(statusEl, 'Running against both nodes...');
   try {
-    const r = await api('POST', '/api/performance/run', { scenario, reps });
+    const r = await api('POST', '/api/performance/run', { reps });
     showSql(document.getElementById('perf-sql'), 'Query just run on both nodes', r.sql);
     document.getElementById('perf-results').style.display = '';
-    const fill = (id, timings) => {
+    const fill = (id, timings, buffers) => {
       const card = document.getElementById(id);
       card.querySelector('.v-runs').textContent = timings.join(', ');
-      const avg = Math.round(timings.reduce((a, b) => a + b, 0) / timings.length);
-      card.querySelector('.v-avg').textContent = `${avg} ms`;
+      const avg = timings.reduce((a, b) => a + b, 0) / timings.length;
+      // Sub-ms averages (PG18's skip scan) round to "0 ms" and look broken
+      // -- keep 2 decimals below 1ms, whole ms otherwise.
+      card.querySelector('.v-avg').textContent = `${avg < 1 ? avg.toFixed(2) : Math.round(avg)} ms`;
+      card.querySelector('.v-buffers').textContent = Math.round(buffers.reduce((a, b) => a + b, 0) / buffers.length).toLocaleString();
     };
-    fill('perf-old-card', r.old);
-    fill('perf-new-card', r.new);
-    const avgOld = r.old.reduce((a, b) => a + b, 0) / r.old.length;
-    const avgNew = r.new.reduce((a, b) => a + b, 0) / r.new.length;
-    const delta = (((avgOld - avgNew) / avgOld) * 100).toFixed(1);
+    fill('perf-old-card', r.old, r.buffers.old);
+    fill('perf-new-card', r.new, r.buffers.new);
+
+    // The headline metric here is buffer pages Postgres reports touching,
+    // not wall-clock -- real, but doesn't need slow storage to make the
+    // point (see the skip-scan comment in server.js).
+    const avgBufOld = r.buffers.old.reduce((a, b) => a + b, 0) / r.buffers.old.length;
+    const avgBufNew = r.buffers.new.reduce((a, b) => a + b, 0) / r.buffers.new.length;
+    const factor = avgBufNew > 0 ? (avgBufOld / avgBufNew).toFixed(0) : '?';
     setStatus(
       statusEl,
-      avgNew < avgOld
-        ? `PG18 averaged ${delta}% faster on this run (${r.label}).`
-        : `PG18 was not faster on this run (${r.label}) -- expected on fast local storage; see the note above.`,
+      avgBufNew < avgBufOld
+        ? `PG18 touched ~${factor}x fewer buffer pages than PG17 on this run (${Math.round(avgBufOld).toLocaleString()} vs ${Math.round(avgBufNew).toLocaleString()}) -- B-tree skip scan, independent of storage speed.`
+        : `PG18 did not touch fewer buffer pages on this run -- unexpected; check the plan in the SQL preview above.`,
       ''
     );
   } catch (err) {
@@ -311,8 +317,8 @@ document.getElementById('btn-run-sql').addEventListener('click', async () => {
 
 // ---- boot --------------------------------------------------------------------
 refreshSecurity().catch(() => {});
+refreshCve().catch(() => {});
 refreshPerformance().catch(() => {});
-loadDiskLimitState().catch(() => {});
 refreshReliability().catch(() => {});
 setInterval(() => {
   refreshPerformance().catch(() => {});

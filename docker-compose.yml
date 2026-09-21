@@ -41,6 +41,48 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
+  # Security, second scenario: CVE-2024-0985, REFRESH MATERIALIZED VIEW
+  # CONCURRENTLY privilege escalation. Deliberately a same-major, minor-
+  # version-only pair (15.5 vs 15.6, fixed 2024-02-08) rather than a major
+  # jump like the pair above -- the point is that minor releases matter too.
+  # Verified by hand: the only known working proof of concept (the CREATE
+  # RULE trick this scenario uses) escalates role r0 to superuser on 15.5
+  # and fails with a clean error on 15.6, with no other difference in setup.
+  # Same "no persistent volume" reasoning as the pair above.
+  # ---------------------------------------------------------------------------
+  pg15-5-security:
+    image: postgres:15.5
+    hostname: pg15-5-security
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./security/init-cve.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    networks: [upgradenet]
+    ports: ["5411:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+
+  pg15-6-security:
+    image: postgres:15.6
+    hostname: pg15-6-security
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./security/init-cve.sql:/docker-entrypoint-initdb.d/10-init.sql:ro
+    networks: [upgradenet]
+    ports: ["5412:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Performance: asynchronous I/O (io_method), PG17 (sync-only) vs PG18.
   # mem_limit caps each container well below the seeded table's size so I/O
   # actually happens instead of everything living in shared_buffers/page
@@ -257,6 +299,8 @@ services:
     environment:
       SEC_OLD_HOST: pg14-security
       SEC_NEW_HOST: pg18-security
+      CVE_OLD_HOST: pg15-5-security
+      CVE_NEW_HOST: pg15-6-security
       PERF_OLD_HOST: pg17-performance
       PERF_NEW_HOST: pg18-performance
       REL_OLD_PRIMARY_HOST: pg16-primary
@@ -287,6 +331,8 @@ services:
     depends_on:
       pg14-security: { condition: service_healthy }
       pg18-security: { condition: service_healthy }
+      pg15-5-security: { condition: service_healthy }
+      pg15-6-security: { condition: service_healthy }
       pg17-performance: { condition: service_healthy }
       pg18-performance: { condition: service_healthy }
       pg16-subscriber: { condition: service_healthy }

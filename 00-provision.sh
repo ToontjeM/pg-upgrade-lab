@@ -16,14 +16,8 @@ if ! docker compose version >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Building images and starting all 10 Postgres containers + the app..."
+echo "Building images and starting all 12 Postgres containers + the app..."
 docker compose up -d --build
-
-# Pre-pull for the Performance tab's disk-throughput control (server.js
-# shells out to a throwaway `alpine` container to apply real cgroup I/O
-# throttling) so the first click of that slider doesn't stall on an image
-# pull.
-docker pull -q alpine >/dev/null 2>&1 || true
 
 echo "Waiting for the demo app to finish bootstrapping (creating the"
 echo "replication topology and seeding the ~3.75GB benchmark table --"
