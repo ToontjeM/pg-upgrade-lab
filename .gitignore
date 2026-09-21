@@ -1,0 +1,2 @@
+# Node dependencies (installed inside the app container at build time)
+node_modules/
